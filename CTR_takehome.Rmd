@@ -1,0 +1,190 @@
+---
+title: "CTR Analysis"
+author: "alane0101"
+date: "April 18, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+###Intro
+This analysis explores the click-through rate (CTR) of ad viewers over 9 days. Because 'click' is encoded as 0 = no click, 1 = click, we know from the start that we want to model a binomial distribution, predicting the likelihood of "click success" with a probability between 0 and 1.
+
+Initial setup:
+
+```{r, include=FALSE}
+
+# Set seed
+set.seed(11235)
+
+# Require packages (some of which were only used in scripting)
+packages <- c("utils", "R.utils", "dplyr", "caret", "stats", "FactoMineR", "lubridate", "tidyr", "rlist", "e1071", "knitr")
+lapply(packages, library, character.only = TRUE)
+```
+
+```{r, eval=FALSE}
+
+# Unzip
+untar("p13-takehome-ml.tar.gz", compressed = TRUE)
+
+setwd("./p13-takehome-ml")
+
+list.files()
+```
+
+
+# Prep Data
+## Explore
+```{r, message=FALSE, warning=FALSE}
+
+training <- read.csv("sampled_training", header = TRUE)
+
+varnames <- names(training)
+```
+
+```{r, eval=FALSE}
+
+str(training) # tells us the type of the variable (num, int, factor w/ n levels)
+summary(training) # tells us min, max, mean, and quartile values for each variable
+anyNA(training) # confirms there are no missing values
+head(training)
+```
+
+Create an index of variable names and the number of uniques they each have, to inform our data cleaning:
+
+```{r, message=FALSE, warning=FALSE}
+
+uniques <- sapply(as.list(varnames), function(varname) {
+  length(unique(training[,varname]))
+})
+
+levels <- data.frame(varnames, uniques)
+```
+
+
+## Preprocessing
+
+Since our outcome is a binary variable and none of our data is continuous, the preprocessing options are limited. We could opt to treat some of the discrete variables as continuous (i.e., assume a linear relationship between that predictor/"covariate" and the outcome) and run a factor analysis for mixed data. E.g.:
+
+```{r, eval=FALSE}
+
+FAMD(training)
+```
+
+But our particular dataset is full of IDs that don't seem like good candidates for feature scaling. (In fact, experimentation revealed that component analysis resulted in a larger in-memory object, due to the creation of sparse matricies.)
+
+The 'caret' package includes a function to identify near-zero variance variables. The assumption is that variables that capture little of the variance are probably not of high predictive value. Based on a call to this function, we remove 'device_id' and 'C16'. Though C16 may have predictive value in spite of its near-zero variance, we don't know enough about the variable to argue for its inclusion and we need to reduce the size of our dataset. 
+
+```{r, message=FALSE, warning=FALSE}
+
+nzv_training <- training[,-(nearZeroVar(training))]
+```
+
+'id' has the same number of unique entries as the number of observations, so it's not predictive and is likely an ID assigned by the ad server upon serving. Along with 'device_id', which we've already removed, 'device_ip' would likely be useful in modelling an individual's behavior, and therefore these variables likely have predictive value in their interactions with the anonymized categorical variables, which may include location, socio-economic status, age, gender, etc. However, the number of levels they contain is ill-suited to building a parsimonious model on a personal computer. We subset accordingly.
+
+```{r, message=FALSE, warning=FALSE}
+
+sub_training <- nzv_training[,-c(1,12)] # 'click' can stay
+```
+
+Let's also prep a version where we split timestamps into separate day of the week and time of day columns:
+
+```{r, message=FALSE, warning=FALSE}
+
+training_tod <- separate(sub_training, hour, into = c("Day", "Hour"), sep = -2) 
+training_tod$Day <- strptime(training_tod$Day, format = "%y%m%d", tz = "GMT")
+training_tod$Day <- wday(training_tod$Day, label = FALSE) # 1 = Mon; 7 = Sunday
+
+# Added for error comparison
+training_tod2 <- separate(training[,-1], hour, into = c("Day", "Hour"), sep = -2)
+training_tod2$Day <- strptime(training_tod2$Day, format = "%y%m%d", tz = "GMT")
+training_tod2$Day <- wday(training_tod2$Day, label = FALSE) # 1 = Mon; 7 = Sunday
+```
+
+
+## Logistic Regression and ANOVA
+
+Additionally, if we had the compute power, we could build a generalized linear model using all of the variables, and then run an analysis of deviance (anova.glm()) to see their effect on the click-through rate. For example:
+
+```{r, eval=FALSE}
+
+logReg <- glm(click ~., family = binomial(link = "logit"), data = train)
+```
+
+Or, even more accurately: 
+
+```{r, eval=FALSE}
+
+logReg <- glm(factor(click) ~ hour + factor(C1) + banner_pos + site_id + site_domain + site_category + app_id + app_domain + device_id + device_model + factor(device_type) + factor(device_conn_type) + factor(C14) + factor(C15) + factor(C16) + factor(C17) + factor(C18) + factor(C19) + factor(C20) + factor(C21), family = binomial(link = "logit"), data = train)
+```
+
+However, glm() encodes each level of a factor/categorical variable as a different linear predictor, so it is not well suited to a dataset with a large number of factor variables. 
+
+
+
+# Analysis
+## Build models
+
+We select Naive Bayes because it is efficient for processing datasets comprised of categorical variables with many levels. In R, Random Forest implementations don't handle categorical predictors with more than 53 categories; the Generalized Boosted Models implementation (gbm) doesn't handle categorical variables with more than 1024 levels. Generalized Linear Models (glm) won't allocate a vector this size for logistic regression in R, as mentioned above.
+
+```{r, message=FALSE, warning=FALSE}
+
+model1 <- naiveBayes(factor(click) ~., data = training[,-1])
+
+model2 <- naiveBayes(factor(click) ~., data = sub_training)
+
+model3 <- naiveBayes(factor(click) ~., data = training_tod)
+
+model4 <- naiveBayes(factor(click) ~., data = training_tod2)
+```
+
+
+## In-sample/misclassification error demonstration
+
+```{r, eval=FALSE}
+
+ISE1 <- mean(predict(model1, newdata = training[,-c(1,2)], type = "class") != training$click)  # 0.5096941
+ISE2 <- mean(predict(model2, newdata = training[,-c(1,2,12,13,19)], type = "class") != training$click)  # 0.3428065
+ISE3 <- mean(predict(model3, newdata = training_tod[,-1], type = "class") != training$click)  #  0.3440762
+ISE4 <- mean(predict(model4, newdata = training_tod2[,-1], type = "class") != training$click) # 0.5094641
+```
+
+Especially with the inclusion of 'training_tod2', we can see that removing noisy predictors is a boon for our classification accuracy. With only 9 days' worth of data, the hour and day of week do not seem to improve our model's accuracy. Thus, our second model--though it may be overfit for having run it against the training set--is our top pick. 
+
+
+## Ready testing data
+
+```{r, message=FALSE, warning=FALSE}
+
+testing <- read.csv("sampled_test", header = FALSE, col.names = varnames[-2])
+
+sub_testing <- testing[,-c(1, 11, 12, 18)]
+```
+
+
+## Make Predictions
+
+```{r, message=FALSE, warning=FALSE}
+
+pred2 <- predict(model2, newdata = sub_testing, type = "raw")
+```
+
+Our goal is to output the likelihood of a click for each entry in the test set, with a probability between 0 and 1. To make it easier to obtain any one estimate, we bind the predictions to a subsettable dataframe, in this manner:
+
+```{r, message=FALSE, warning=FALSE}
+
+outcomes2 <- data.frame(pred2[,2])
+```
+
+
+# Discussion and Future Direction
+
+To assess the accuracy of our models, we would typically run a confusion matrix on the predictions versus the outcome column of the test set, but presumably the author of the assignment has withheld that data for the same purpose. 
+
+Because Naive Bayes ignores interactions between variables, we would ideally develop a better understanding of the variables remaining in Model 2 and identify more of them for removal. As we attempted to demonstrate using the in-sample error, this is likely to improve our Naive Bayes model's accuracy by virtue of making it less noisy. One way to improve our understanding would be to compare the levels observed for each categorical variable in the test and training sets, noting any variables for which there were zero observations in the training set of a level observed in the test set. (Naive Bayes assigns a zero probability to these.)
+
+Additionally, as mentioned in the Proprocessing section above, it is reasonable to suspect that there might be informative interactions between variables, so we would also ideally run a model capable of identifying these interactions (such as logistic regression) in a setting with much more compute capacity. Alternatively, we could preprocess the dataset to capture interactions as independent features, before modeling with Naive Bayes or similar.
+
+
